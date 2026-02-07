@@ -362,16 +362,42 @@ class OptimizedCommander:
             except: pass
 
             # 5. 费率面 (NEW)
+            # === 资金费率智能处理 (Auto-Fix) ===
             funding_rate = self.get_funding_rate()
+            
             if funding_rate is not None:
+                # 1. 默认尝试：假设它是标准小数 (如 0.0001)
                 fr_percent = funding_rate * 100 
+                
+                # 2. 第一次纠错：如果结果太吓人 (超过 ±5%)
+                # 说明原始数据可能已经是百分数了 (如 -0.25)
+                if abs(fr_percent) > 5:
+                    fr_percent = funding_rate # 直接用原始值 (-0.25%)
+                
+                # 3. 第二次纠错：如果还是太吓人 (超过 ±5%)
+                # 说明原始数据可能是整数基点 (如 -25)
+                if abs(fr_percent) > 5:
+                    fr_percent = funding_rate / 100 # 除以100 (-0.25%)
+                
+                # 4. 格式化显示
                 funding_msg = f"{fr_percent:.4f}%"
+                
+                # 5. 评分逻辑 (基于正确的百分比打分)
+                # 费率 > 0.03% (万三) -> 危险，多头太挤
                 if fr_percent > 0.03: s_funding_score = 20
+                # 费率 > 0.01% (万一) -> 略热
                 elif fr_percent > 0.01: s_funding_score = 40
-                elif fr_percent < -0.02: s_funding_score = 80
+                # 费率 < -0.01% (负费率) -> 机会，空头太挤
+                elif fr_percent < -0.01: s_funding_score = 80
+                # 费率 < 0 -> 偏多头利好
                 elif fr_percent < 0: s_funding_score = 60
                 else: s_funding_score = 50
             
+            else:
+                # 如果完全获取不到
+                s_funding_score = 50
+                funding_msg = "暂无数据"
+                          
         except Exception as e: 
             print(f"分析出错: {e}")
             pass
