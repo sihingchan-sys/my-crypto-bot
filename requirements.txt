@@ -6,3 +6,6 @@ ta
 plotly
 feedparser
 textblob
+requests
+datatime
+os
