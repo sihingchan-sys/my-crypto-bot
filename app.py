@@ -10,6 +10,50 @@ import os
 import ccxt
 import requests
 
+# === 插入到 class OptimizedCommander 之前 ===
+class TradeLogger:
+    def __init__(self, filename='my_trade_journal.csv'):
+        self.filename = filename
+        
+    def load_log(self):
+        if os.path.exists(self.filename):
+            return pd.read_csv(self.filename)
+        else:
+            return pd.DataFrame(columns=['记录时间', '交易对', '周期', '方向', '投入金额(U)', '开仓价', '平仓价', '状态', '盈亏(U)', '收益率(%)'])
+
+    def add_trade(self, symbol, tf, direction, entry, amount):
+        df = self.load_log()
+        new_row = {
+            '记录时间': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            '交易对': symbol,
+            '周期': tf,
+            '方向': direction,
+            '投入金额(U)': float(amount),
+            '开仓价': float(entry),
+            '平仓价': 0.0,
+            '状态': '⏳挂单中', 
+            '盈亏(U)': 0.0,
+            '收益率(%)': 0.0
+        }
+        df = pd.concat([pd.DataFrame([new_row]), df], ignore_index=True)
+        df.to_csv(self.filename, index=False)
+
+    def save_log(self, df):
+        for i, row in df.iterrows():
+            if row['状态'] in ['✅止盈', '❌止损', '🚀交易中'] and float(row['平仓价']) > 0:
+                entry = float(row['开仓价'])
+                close = float(row['平仓价'])
+                amt = float(row['投入金额(U)'])
+                # 计算盈亏
+                pnl = (close - entry) / entry * amt if '多' in row['方向'] else (entry - close) / entry * amt
+                roi = (close - entry) / entry * 100 if '多' in row['方向'] else (entry - close) / entry * 100
+                df.at[i, '盈亏(U)'] = round(pnl, 2)
+                df.at[i, '收益率(%)'] = round(roi, 2)
+            elif row['状态'] == '🗑️撤单':
+                df.at[i, '盈亏(U)'] = 0
+                df.at[i, '收益率(%)'] = 0
+        df.to_csv(self.filename, index=False)
+
 # --- 1. 页面配置 ---
 st.set_page_config(page_title="AI 量化指挥官 (US IP 修复版)", layout="wide", page_icon="🛡️")
 st.title("🛡️ Crypto AI 指挥官 (Day 6 Final Fix)")
@@ -19,23 +63,55 @@ st.title("🛡️ Crypto AI 指挥官 (Day 6 Final Fix)")
 class OptimizedCommander:
     def __init__(self, symbol, tf):
         self.symbol = symbol
-        self.tf = tf
-        self.history_file = 'ai_signal_history_v3.csv' 
+        self.tf = tf 
 
-    # === A. 数据获取 ===
+    # === A. 数据获取 (修正版：修复 ts 丢失问题) ===
     def get_data(self):
         try:
-            period_map = {'15m': '20d', '1h': '6mo', '1d': '2y'}
-            period = period_map.get(self.tf, '1mo')
-            df = yf.download(self.symbol, period=period, interval=self.tf, progress=False)
-            if df.empty: return None
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            df = df.rename(columns={'Open': 'o', 'High': 'h', 'Low': 'l', 'Close': 'c', 'Volume': 'v'})
-            df['ts'] = df.index
-            df['ema200'] = ta.trend.EMAIndicator(df['c'], window=200).ema_indicator()
-            return df
-        except: return None
+            import ccxt
+            # 1. 初始化交易所
+            try:
+                exchange = ccxt.kraken({'timeout': 3000})
+                symbol_map = {'BTC-USD': 'BTC/USD', 'ETH-USD': 'ETH/USD'}
+                target_symbol = symbol_map.get(self.symbol, self.symbol.replace('-', '/'))
+                # 抓取数据
+                timeframe_map = {'15m': '15m', '1h': '60m', '1d': '1440m'} # Kraken有时需要特定格式，通用尝试直接传
+                ohlcv = exchange.fetch_ohlcv(target_symbol, self.tf, limit=300)
+            except:
+                # 备用 Gate
+                exchange = ccxt.gate({'timeout': 3000})
+                target_symbol = self.symbol.replace('-', '_')
+                ohlcv = exchange.fetch_ohlcv(target_symbol, self.tf, limit=300)
 
+            # 2. 整理数据
+            df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+            df['ts'] = pd.to_datetime(df['ts'], unit='ms') 
+            df.set_index('ts', inplace=True) # ts 变成了索引
+            
+            # 🔥🔥🔥 关键修复在这里：把索引复制回列 🔥🔥🔥
+            df['ts'] = df.index 
+            
+            # 3. 计算指标
+            df['ema200'] = ta.trend.EMAIndicator(df['c'], window=200).ema_indicator()
+            
+            return df
+            
+        except Exception as e:
+            # print(f"CCXT 失败，回退到 Yahoo: {e}")
+            # 降级方案：使用 yfinance
+            try:
+                period_map = {'15m': '5d', '1h': '1mo', '1d': '1y'}
+                period = period_map.get(self.tf, '1mo')
+                df = yf.download(self.symbol, period=period, interval=self.tf, progress=False)
+                if df.empty: return None
+                if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+                df = df.rename(columns={'Open': 'o', 'High': 'h', 'Low': 'l', 'Close': 'c', 'Volume': 'v'})
+                
+                # Yahoo 也是同样的处理逻辑
+                df['ts'] = df.index 
+                df['ema200'] = ta.trend.EMAIndicator(df['c'], window=200).ema_indicator()
+                return df
+            except: return None
     # === B. 核心策略 ===
     def calculate_strategy(self, current_price, ref_df, current_ema=None, use_filter=False):
         if len(ref_df) < 2: return None
@@ -189,93 +265,8 @@ class OptimizedCommander:
             print(f"AI 训练失败: {e}")
             return {'sl_pct': 0.02, 'rr': 1.5} # 出错返回默认
 
-    # === D. 自动记录与审计 ===
-    def audit_history(self):
-        if not os.path.exists(self.history_file): return pd.DataFrame()
-        
-        df = pd.read_csv(self.history_file)
-        if df.empty: return df
-        
-        # 审计数据获取
-        audit_data = yf.download(self.symbol, period='60d', interval='1d', progress=False)
-        if audit_data.empty: return df
-        if isinstance(audit_data.columns, pd.MultiIndex): audit_data.columns = audit_data.columns.get_level_values(0)
-        
-        updated = False
-        
-        for index, row in df.iterrows():
-            if "⏳" in str(row['结果']):
-                try:
-                    signal_date = pd.to_datetime(row['记录时间']).date()
-                    future_data = audit_data[audit_data.index.date >= signal_date]
-                    
-                    entry = float(row['挂单价'])
-                    tp = float(row['止盈'])
-                    sl = float(row['止损'])
-                    is_long = row['方向'] == "多"
-                    
-                    for idx, day in future_data.iterrows():
-                        if day['Low'] <= entry <= day['High']:
-                            status = None
-                            close_price = 0
-                            if is_long:
-                                if day['Low'] <= sl: status = "❌止损"; close_price = sl; updated=True
-                                elif day['High'] >= tp: status = "🏆止盈"; close_price = tp; updated=True
-                            else:
-                                if day['High'] >= sl: status = "❌止损"; close_price = sl; updated=True
-                                elif day['Low'] <= tp: status = "🏆止盈"; close_price = tp; updated=True
-                            
-                            if status:
-                                df.at[index, '结果'] = status
-                                df.at[index, '平仓价'] = close_price
-                                break
-                except: pass
-            
-        if updated:
-            df.to_csv(self.history_file, index=False)
-            
-        return df
 
-    # === E. 防重保存 ===
-    def save_signal(self, plan, score):
-        if not plan: return
-        if not plan['is_allowed']: return
-
-        ref_date_str = plan['ref_date'].strftime('%Y-%m-%d')
-        current_entry = round(plan['entry'], 2)
-        current_dir = "多" if "做多" in plan['dir'] else "空"
-        
-        new_record = {
-            '记录时间': datetime.now().strftime('%Y-%m-%d %H:%M'),
-            '交易对': self.symbol,
-            '周期': self.tf,
-            '基准日期': ref_date_str,
-            '方向': current_dir,
-            '挂单价': current_entry,
-            '平仓价': 0,
-            '止盈': round(plan['tp'], 2),
-            '止损': round(plan['sl'], 2),
-            'AI信心': int(score),
-            '结果': '⏳挂单中'
-        }
-        
-        if not os.path.exists(self.history_file):
-            pd.DataFrame([new_record]).to_csv(self.history_file, index=False)
-            return
-
-        df = pd.read_csv(self.history_file)
-        if not df.empty:
-            if '基准日期' not in df.columns: df['基准日期'] = '0000-00-00'
-            duplicate_check = df[
-                (df['交易对'] == self.symbol) & (df['周期'] == self.tf) &
-                (df['基准日期'] == ref_date_str) & (df['方向'] == current_dir) &
-                (df['挂单价'].astype(str) == str(current_entry)) 
-            ]
-            if not duplicate_check.empty: return 
-
-        pd.DataFrame([new_record]).to_csv(self.history_file, mode='a', header=False, index=False)
-        
-    # === F. 获取资金费率 (US IP 修复版) ===
+        # === F. 获取资金费率 (US IP 修复版) ===
     def get_funding_rate(self):
         # 通道 1: Kraken Futures (美国合规，绝对可用)
         try:
@@ -390,6 +381,44 @@ tf = tf_options[st.sidebar.selectbox("作战周期", list(tf_options.keys()), in
 use_ema_filter = st.sidebar.checkbox("✅ 开启 EMA 过滤", value=True)
 backtest_days = st.sidebar.slider("回测天数", 30, 365, 90)
 
+# === 插入到 bot = OptimizedCommander(...) 之后 ===
+logger = TradeLogger() # 初始化记账员
+
+st.sidebar.divider()
+st.sidebar.subheader("📓 我的实盘账本")
+log_df = logger.load_log()
+
+if not log_df.empty:
+    # 算总账
+    total_pnl = log_df['盈亏(U)'].sum()
+    win_count = len(log_df[log_df['盈亏(U)'] > 0])
+    done_count = len(log_df[log_df['状态'].isin(['✅止盈', '❌止损'])])
+    win_rate = (win_count / done_count * 100) if done_count > 0 else 0
+    
+    c1, c2 = st.sidebar.columns(2)
+    c1.metric("累计盈亏", f"${total_pnl:.2f}", delta_color="normal" if total_pnl>=0 else "inverse")
+    c2.metric("实战胜率", f"{win_rate:.0f}%")
+
+    st.sidebar.caption("👇 在下方直接修改状态和平仓价 (Enter保存):")
+    # 可编辑表格
+    edited_df = st.sidebar.data_editor(
+        log_df,
+        column_config={
+            "状态": st.column_config.SelectboxColumn("状态", options=['⏳挂单中', '🚀交易中', '✅止盈', '❌止损', '🗑️撤单'], required=True),
+            "平仓价": st.column_config.NumberColumn("平仓价", min_value=0, step=0.1, format="$%.2f"),
+            "投入金额(U)": st.column_config.NumberColumn(format="$%.0f"),
+            "盈亏(U)": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+        },
+        hide_index=True,
+        num_rows="dynamic"
+    )
+    # 保存修改
+    if not edited_df.equals(log_df):
+        logger.save_log(edited_df)
+        st.rerun()
+else:
+    st.sidebar.info("暂无记录，快去决策页开单吧！")
+
 # 初始化
 bot = OptimizedCommander(symbol, tf)
 # ... 之前的主程序代码 ...
@@ -426,45 +455,7 @@ with st.spinner('🚀 正在全速运转...'):
     # 加权公式
     final_score = s_t*0.4 + s_f*0.2 + s_m*0.2 + s_fr*0.2
     
-    bot.save_signal(plan, final_score)
-    hist_df = bot.audit_history()
     backtest_df, wins, losses = bot.run_backtest(backtest_days, use_ema_filter)
-
-# === 侧边栏：实盘战绩 ===
-st.sidebar.divider()
-st.sidebar.subheader("🏆 实盘战绩 (审计)")
-
-def render_stats(df_target, title_prefix):
-    if df_target.empty:
-        st.sidebar.caption(f"暂无 {title_prefix} 记录")
-        return
-    
-    real_wins = len(df_target[df_target['结果'].str.contains("止盈")])
-    real_losses = len(df_target[df_target['结果'].str.contains("止损")])
-    total_real = real_wins + real_losses
-    real_rate = (real_wins / total_real * 100) if total_real > 0 else 0
-    
-    c1, c2 = st.sidebar.columns(2)
-    c1.metric(f"{title_prefix}完结", f"{total_real}单")
-    c2.metric("真实胜率", f"{real_rate:.0f}%", delta="实战")
-    
-    st.sidebar.caption(f"📜 {title_prefix} 记录 (最新5条):")
-    display_cols = ['记录时间','方向','挂单价','平仓价','结果']
-    valid_cols = [c for c in display_cols if c in df_target.columns]
-    hist_display = df_target[valid_cols].tail(5).iloc[::-1].copy()
-    if '平仓价' in hist_display.columns:
-        hist_display['平仓价'] = hist_display['平仓价'].apply(lambda x: f"{x:.2f}" if float(x) > 0 else "-")
-    # 修复警告：移除 use_container_width
-    st.sidebar.dataframe(hist_display, hide_index=True)
-
-if not hist_df.empty:
-    t_all, t_15m, t_1h, t_1d = st.sidebar.tabs(["全部", "15m", "1h", "1d"])
-    with t_all: render_stats(hist_df, "全部")
-    with t_15m: render_stats(hist_df[hist_df['周期'] == '15m'], "15m")
-    with t_1h: render_stats(hist_df[hist_df['周期'] == '1h'], "1h")
-    with t_1d: render_stats(hist_df[hist_df['周期'] == '1d'], "1d")
-else:
-    st.sidebar.info("暂无实盘记录，等待信号...")
 
 # === 主界面 Tabs ===
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🏠 决策", "📈 技术", "🇺🇸 资金", "🐋 主力", "🗞️ 舆情", "🧪 回测"])
@@ -496,18 +487,41 @@ with tab1:
             - **> 60%**: 极度确信 -> **正常/重仓** (30%+ 本金) 💰
             """)
 
+   # === 替换 Tab 1 下的 with c2: 里面的内容 ===
     with c2:
         if plan and plan['is_allowed']:
+            # 原有的显示指标代码
             k1, k2, k3 = st.columns(3)
             k1.metric("挂单 Entry", f"${plan['entry']:.2f}", plan['dir'])
             k2.metric("止盈 TP", f"${plan['tp']:.2f}")
             k3.metric("止损 SL", f"${plan['sl']:.2f}", delta_color="inverse")
-            st.success("✅ 信号有效：请在交易所挂限价单 (Limit Order)。")
-            with st.expander("🛠️ 实战操作指南 (新手必读)", expanded=True):
-                st.markdown(f"1. **{symbol}** 开 **限价单(Limit)**。\n2. 价格 **{plan['entry']:.2f}** | 止盈 **{plan['tp']:.2f}** | 止损 **{plan['sl']:.2f}**。\n3. **{tf}** 周期，未成交请勿追单。")
+            
+            st.divider()
+            st.markdown("### 📝 战术记录板")
+            
+            # --- 新增：开单表单 ---
+            with st.form("manual_trade_form"):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    # 默认投入 100U，你可以自己改默认值
+                    trade_amt = st.number_input("本单投入 (USDT)", min_value=10.0, value=100.0, step=10.0)
+                with col_b:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    # 提交按钮
+                    submit = st.form_submit_button("⚡ 一键记录本单")
+                
+                if submit:
+                    # 自动读取当前方向
+                    raw_dir = "多" if "做多" in plan['dir'] else "空"
+                    # 写入日志
+                    logger.add_trade(symbol, tf, raw_dir, plan['entry'], trade_amt)
+                    st.success(f"✅ 已记录：{symbol} {raw_dir} @ {plan['entry']:.2f}")
+                    st.rerun() # 刷新立刻显示
+            # ---------------------
+            
         else:
             st.warning("🚫 信号被拦截：当前逆势或数据不足，建议观望。")
-
+            
     st.markdown("---")
     if plan:
         st.subheader("🗺️ 战场地图")
