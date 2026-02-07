@@ -7,10 +7,12 @@ import feedparser
 from textblob import TextBlob
 from datetime import datetime, timedelta
 import os
+import ccxt
+import requests
 
 # --- 1. 页面配置 ---
-st.set_page_config(page_title="AI 量化指挥官 (钻石防重版)", layout="wide", page_icon="🛡️")
-st.title("🛡️ Crypto AI 指挥官 (Day 6 Diamond Fix)")
+st.set_page_config(page_title="AI 量化指挥官 (US IP 修复版)", layout="wide", page_icon="🛡️")
+st.title("🛡️ Crypto AI 指挥官 (Day 6 Final Fix)")
 
 # --- 2. 核心全能引擎 (逻辑层) ---
 
@@ -18,7 +20,7 @@ class OptimizedCommander:
     def __init__(self, symbol, tf):
         self.symbol = symbol
         self.tf = tf
-        self.history_file = 'ai_signal_history_v3.csv' # 升级文件名，强制使用新格式
+        self.history_file = 'ai_signal_history_v3.csv' 
 
     # === A. 数据获取 ===
     def get_data(self):
@@ -109,6 +111,83 @@ class OptimizedCommander:
             if not res_df.empty and cfg['interval'] == '1d': res_df = res_df.tail(days)
             return res_df, wins, losses
         except: return None, 0, 0
+        
+        # === H. AI 参数自适应引擎 (NEW!) ===
+    def ai_optimize_parameters(self, days=30):
+        """
+        AI 机器人：自动寻找最近一段行情中胜率最高的 止盈/止损 比例
+        """
+        try:
+            # 1. 获取数据
+            df = self.get_data() # 获取最新数据
+            if df is None or len(df) < 100: return None
+            
+            # 为了速度，只切片最近 days 天的数据进行训练
+            # 计算切片索引
+            rows_per_day = 24 if '1h' in self.tf else (96 if '15m' in self.tf else 1)
+            train_len = days * rows_per_day
+            if len(df) > train_len:
+                train_df = df.iloc[-train_len:]
+            else:
+                train_df = df
+                
+            # 2. 定义搜索空间 (让 AI 尝试这些组合)
+            # 止损比例: 1% 到 5%
+            sl_range = [0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05] 
+            # 盈亏比: 1:1 到 1:3
+            rr_range = [1.0, 1.5, 2.0, 2.5, 3.0] 
+            
+            best_score = -9999
+            best_params = {'sl_pct': 0.02, 'rr': 1.5} # 默认值
+            
+            # 3. 开始暴力训练 (Grid Search)
+            # print("🤖 AI 正在训练中...")
+            
+            for sl_pct in sl_range:
+                for rr in rr_range:
+                    # 模拟回测
+                    total_pnl = 0
+                    wins = 0
+                    count = 0
+                    
+                    # 简化版快速回测循环
+                    # 假设每次都在 EMA 附近开单 (模拟策略逻辑)
+                    ema_col = train_df['ema200']
+                    close_col = train_df['c']
+                    
+                    for i in range(1, len(train_df)):
+                        price = close_col.iloc[i]
+                        ema = ema_col.iloc[i]
+                        
+                        # 简单的趋势跟随逻辑作为训练基准
+                        if price > ema: # 多头趋势
+                            entry = price
+                            stop_loss = entry * (1 - sl_pct)
+                            take_profit = entry * (1 + sl_pct * rr)
+                            
+                            # 往后看几根K线定输赢 (简化)
+                            future = train_df.iloc[i+1:min(i+10, len(train_df))]
+                            if future.empty: continue
+                            
+                            if future['l'].min() <= stop_loss:
+                                total_pnl -= 1 # 亏1份
+                            elif future['h'].max() >= take_profit:
+                                total_pnl += rr # 赚rr份
+                                wins += 1
+                            count += 1
+                            
+                    # 4. 给这组参数打分
+                    if count > 0:
+                        score = total_pnl # 净利润就是分数
+                        if score > best_score:
+                            best_score = score
+                            best_params = {'sl_pct': sl_pct, 'rr': rr}
+                            
+            return best_params
+            
+        except Exception as e:
+            print(f"AI 训练失败: {e}")
+            return {'sl_pct': 0.02, 'rr': 1.5} # 出错返回默认
 
     # === D. 自动记录与审计 ===
     def audit_history(self):
@@ -157,13 +236,11 @@ class OptimizedCommander:
             
         return df
 
-    # 🔥🔥🔥 核弹级防重逻辑 🔥🔥🔥
+    # === E. 防重保存 ===
     def save_signal(self, plan, score):
         if not plan: return
         if not plan['is_allowed']: return
 
-        # 核心：使用【基准日期】作为防伪ID
-        # 15m信号的ref_date是昨天，只要昨天没变，信号就不该变
         ref_date_str = plan['ref_date'].strftime('%Y-%m-%d')
         current_entry = round(plan['entry'], 2)
         current_dir = "多" if "做多" in plan['dir'] else "空"
@@ -172,7 +249,7 @@ class OptimizedCommander:
             '记录时间': datetime.now().strftime('%Y-%m-%d %H:%M'),
             '交易对': self.symbol,
             '周期': self.tf,
-            '基准日期': ref_date_str, # 新增列：防重核心
+            '基准日期': ref_date_str,
             '方向': current_dir,
             '挂单价': current_entry,
             '平仓价': 0,
@@ -182,59 +259,87 @@ class OptimizedCommander:
             '结果': '⏳挂单中'
         }
         
-        # 1. 如果文件不存在，直接保存
         if not os.path.exists(self.history_file):
             pd.DataFrame([new_record]).to_csv(self.history_file, index=False)
             return
 
-        # 2. 读取现有数据
         df = pd.read_csv(self.history_file)
-        
-        # 3. 超级严格的检查
-        # 规则：如果在历史记录里，找到了 [同交易对] + [同周期] + [同基准日期] + [同方向] + [同价格] 的记录
-        # 那么，绝对禁止保存！不管你是几点刷新的。
         if not df.empty:
-            # 兼容旧文件没有 '基准日期' 的情况 (虽然建议删文件，但防止万一)
-            if '基准日期' not in df.columns:
-                df['基准日期'] = '0000-00-00' # 填充默认值
-            
-            # 强制转字符串比对，消灭浮点误差
-            # 检查：有没有一条记录，它的基准日期 == 今天的基准日期 AND 挂单价 == 今天的挂单价
+            if '基准日期' not in df.columns: df['基准日期'] = '0000-00-00'
             duplicate_check = df[
-                (df['交易对'] == self.symbol) &
-                (df['周期'] == self.tf) &
-                (df['基准日期'] == ref_date_str) & 
-                (df['方向'] == current_dir) &
+                (df['交易对'] == self.symbol) & (df['周期'] == self.tf) &
+                (df['基准日期'] == ref_date_str) & (df['方向'] == current_dir) &
                 (df['挂单价'].astype(str) == str(current_entry)) 
             ]
-            
-            if not duplicate_check.empty:
-                # print("发现重复信号，拦截保存！") # 调试用
-                return 
+            if not duplicate_check.empty: return 
 
-        # 4. 通过检查，保存
         pd.DataFrame([new_record]).to_csv(self.history_file, mode='a', header=False, index=False)
-
-    # === E. 辅助分析 ===
-    def analyze_score(self, df, etf_ticker, symbol):
+        
+    # === F. 获取资金费率 (US IP 修复版) ===
+    def get_funding_rate(self):
+        # 通道 1: Kraken Futures (美国合规，绝对可用)
         try:
-            if df is None: return 50, 50, 50, 50, 0, []
-            rsi = ta.momentum.RSIIndicator(df['c']).rsi().iloc[-1]
-            ema = df['ema200'].iloc[-1] if 'ema200' in df else df['c'].mean()
-            s_tech = ( (50+(50-rsi)) + (80 if df['c'].iloc[-1]>ema else 20) ) / 2
+            exchange = ccxt.krakenfutures({'enableRateLimit': True, 'timeout': 2000})
+            # Kraken 合约代码通常是 PF_XBTUSD
+            funding = exchange.fetch_funding_rate('PF_XBTUSD')
+            print("✅ 成功连接: Kraken Futures")
+            return float(funding['fundingRate'])
+        except Exception as e:
+            # print(f"Kraken 失败: {e}")
+            pass
+
+        # 通道 2: Gate.io (IP限制较宽)
+        try:
+            exchange = ccxt.gate({'enableRateLimit': True, 'timeout': 2000, 'options': {'defaultType': 'swap'}})
+            # Gate 合约代码: BTC_USDT
+            funding = exchange.fetch_funding_rate('BTC_USDT')
+            print("✅ 成功连接: Gate.io")
+            return float(funding['fundingRate'])
+        except Exception:
+            pass
+
+        # 通道 3: Binance HTTP (仅作最后尝试，美国IP会失败)
+        try:
+            url = "https://fapi.binance.com/fapi/v1/premiumIndex"
+            params = {'symbol': f"{self.symbol.split('-')[0]}USDT"}
+            headers = {'User-Agent': 'Mozilla/5.0'} # 伪装浏览器
+            r = requests.get(url, params=params, headers=headers, timeout=2)
+            if r.status_code == 200:
+                data = r.json()
+                print("✅ 成功连接: Binance HTTP")
+                return float(data['lastFundingRate'])
+        except Exception:
+            pass
+
+        return None # 彻底失败
+
+    # === G. 综合打分 ===
+    def analyze_score(self, df, etf_ticker, symbol):
+        # 初始化默认值
+        s_tech, s_fund, s_main, s_news, ema, news_items = 50, 50, 50, 50, 0, []
+        s_funding_score, funding_msg = 50, "获取失败"
+
+        try:
+            # 1. 技术面
+            if df is not None:
+                rsi = ta.momentum.RSIIndicator(df['c']).rsi().iloc[-1]
+                ema = df['ema200'].iloc[-1] if 'ema200' in df else df['c'].mean()
+                s_tech = ( (50+(50-rsi)) + (80 if df['c'].iloc[-1]>ema else 20) ) / 2
             
-            s_fund = 50
+            # 2. 资金面 (ETF)
             try:
                 edf = yf.Ticker(etf_ticker).history(period="1mo")
                 if not edf.empty:
                     chg = edf['Close'].iloc[-1] - edf['Close'].iloc[-2]
                     s_fund = 60 if chg > 0 else 40
             except: pass
-                
-            cmf = ta.volume.ChaikinMoneyFlowIndicator(df['h'], df['l'], df['c'], df['v'], window=20).chaikin_money_flow().iloc[-1]
-            s_main = 50 + cmf*200
             
-            s_news, news_items = 50, []
+            # 3. 主力面 (CMF)
+            if df is not None:
+                cmf = ta.volume.ChaikinMoneyFlowIndicator(df['h'], df['l'], df['c'], df['v'], window=20).chaikin_money_flow().iloc[-1]
+                s_main = 50 + cmf*200
+            
+            # 4. 舆情面
             try:
                 kw = 'Bitcoin' if 'BTC' in symbol else symbol.split('-')[0]
                 rss = f"https://news.google.com/rss/search?q={kw}+crypto+when:1d&hl=en-US&gl=US&ceid=US:en"
@@ -243,9 +348,23 @@ class OptimizedCommander:
                 if scores: s_news = (sum(scores)/len(scores) + 1) * 50
                 news_items = feed.entries[:5]
             except: pass
+
+            # 5. 费率面 (NEW)
+            funding_rate = self.get_funding_rate()
+            if funding_rate is not None:
+                fr_percent = funding_rate * 100 
+                funding_msg = f"{fr_percent:.4f}%"
+                if fr_percent > 0.03: s_funding_score = 20
+                elif fr_percent > 0.01: s_funding_score = 40
+                elif fr_percent < -0.02: s_funding_score = 80
+                elif fr_percent < 0: s_funding_score = 60
+                else: s_funding_score = 50
             
-            return s_tech, s_fund, s_main, s_news, ema, news_items
-        except: return 50, 50, 50, 50, 0, []
+        except Exception as e: 
+            print(f"分析出错: {e}")
+            pass
+        
+        return s_tech, s_fund, s_main, s_news, ema, news_items, s_funding_score, funding_msg      
 
 # --- 3. 执行逻辑 ---
 st.sidebar.header("🎛️ 指挥台")
@@ -271,16 +390,25 @@ tf = tf_options[st.sidebar.selectbox("作战周期", list(tf_options.keys()), in
 use_ema_filter = st.sidebar.checkbox("✅ 开启 EMA 过滤", value=True)
 backtest_days = st.sidebar.slider("回测天数", 30, 365, 90)
 
-# 权重微调
-with st.sidebar.expander("⚙️ 权重设置"):
-    w_tech = st.slider("技术", 0.0, 1.0, 0.4)
-    w_fund = st.slider("资金", 0.0, 1.0, 0.3)
-    w_main = st.slider("主力", 0.0, 1.0, 0.2)
-    w_news = st.slider("舆情", 0.0, 1.0, 0.1)
-
 # 初始化
 bot = OptimizedCommander(symbol, tf)
+# ... 之前的主程序代码 ...
 
+# === 🔥 AI 进化模块 ===
+if st.sidebar.checkbox("🤖 开启 AI 参数自适应", value=False):
+    with st.sidebar.status("🤖 AI 机器人正在学习最近30天行情...", expanded=True) as status:
+        best_params = bot.ai_optimize_parameters(days=30)
+        status.update(label="✅ 学习完成！", state="complete", expanded=False)
+        
+    if best_params:
+        st.sidebar.markdown("### 🧠 AI 优化建议")
+        st.sidebar.info(f"""
+        根据近期波动，最佳参数为：
+        - **止损幅度**: {best_params['sl_pct']*100:.1f}%
+        - **盈亏比**: 1:{best_params['rr']}
+        """)
+        # 你甚至可以让 AI 自动覆盖你的 plan
+        # (这需要修改 calculate_strategy 接收外部参数，比较复杂，暂时先手动参考)
 with st.spinner('🚀 正在全速运转...'):
     df_k = bot.get_data()
     curr_price = df_k['c'].iloc[-1] if df_k is not None else 0
@@ -291,14 +419,18 @@ with st.spinner('🚀 正在全速运转...'):
     if isinstance(ref_df.columns, pd.MultiIndex): ref_df.columns = ref_df.columns.get_level_values(0)
     
     plan = bot.calculate_strategy(curr_price, ref_df, curr_ema, use_ema_filter)
-    s_t, s_f, s_m, s_n, ema_val, news_list = bot.analyze_score(df_k, 'IBIT', symbol)
-    final_score = s_t*w_tech + s_f*w_fund + s_m*w_main + s_n*w_news
+    
+    # 接收参数
+    s_t, s_f, s_m, s_n, ema_val, news_list, s_fr, fr_msg = bot.analyze_score(df_k, 'IBIT', symbol)
+    
+    # 加权公式
+    final_score = s_t*0.4 + s_f*0.2 + s_m*0.2 + s_fr*0.2
     
     bot.save_signal(plan, final_score)
     hist_df = bot.audit_history()
     backtest_df, wins, losses = bot.run_backtest(backtest_days, use_ema_filter)
 
-# === 侧边栏：实盘战绩 (分频道增强版) ===
+# === 侧边栏：实盘战绩 ===
 st.sidebar.divider()
 st.sidebar.subheader("🏆 实盘战绩 (审计)")
 
@@ -307,7 +439,6 @@ def render_stats(df_target, title_prefix):
         st.sidebar.caption(f"暂无 {title_prefix} 记录")
         return
     
-    # 统计
     real_wins = len(df_target[df_target['结果'].str.contains("止盈")])
     real_losses = len(df_target[df_target['结果'].str.contains("止损")])
     total_real = real_wins + real_losses
@@ -319,11 +450,11 @@ def render_stats(df_target, title_prefix):
     
     st.sidebar.caption(f"📜 {title_prefix} 记录 (最新5条):")
     display_cols = ['记录时间','方向','挂单价','平仓价','结果']
-    # 兼容旧数据防止报错
     valid_cols = [c for c in display_cols if c in df_target.columns]
     hist_display = df_target[valid_cols].tail(5).iloc[::-1].copy()
     if '平仓价' in hist_display.columns:
         hist_display['平仓价'] = hist_display['平仓价'].apply(lambda x: f"{x:.2f}" if float(x) > 0 else "-")
+    # 修复警告：移除 use_container_width
     st.sidebar.dataframe(hist_display, hide_index=True)
 
 if not hist_df.empty:
@@ -341,12 +472,17 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🏠 决策", "📈 技术", "�
 with tab1:
     c1, c2 = st.columns([1, 2])
     with c1:
+        # 仪表盘
         fig_g = go.Figure(go.Indicator(mode="gauge+number", value=final_score, gauge={'axis': {'range': [0, 100]}, 'steps': [{'range': [0, 40], 'color': '#FF4B4B'}, {'range': [60, 100], 'color': '#00CC96'}]}))
         fig_g.update_layout(height=250, margin=dict(t=30,b=20,l=20,r=20))
+        # 修复警告：Plotly 保持 use_container_width=True (这是新版推荐写法)
         st.plotly_chart(fig_g, use_container_width=True)
+        
+        # 🔥 找回丢失的 UI：信心度显示
         confidence = abs(final_score - 50) * 2
         st.info(f"💡 AI 信心度: {confidence:.0f}%")
         
+        # 🔥 找回丢失的 UI：详细说明
         with st.expander("📖 如何看懂仪表盘 (仓位参考)?", expanded=False):
             st.markdown("""
             **1. 指针区域与方向:**
@@ -382,7 +518,8 @@ with tab1:
             {"代号": "S1", "价格": plan['S1'], "说明": "地板/接多点"},
             {"代号": "S2", "价格": plan['S2'], "说明": "岩浆/强支撑"},
         ]
-        st.dataframe(pd.DataFrame(table_data), use_container_width=True)
+        # 修复警告：DataFrame 移除 use_container_width
+        st.dataframe(pd.DataFrame(table_data))
 
 with tab2:
     if df_k is not None:
@@ -398,20 +535,112 @@ with tab2:
             st.caption("🍊 EMA200: 牛熊分界线。🔵 Pivot: 挂单系统。")
 
 with tab3:
-    st.metric("资金面评分", f"{s_f:.0f}", delta="基于ETF流向")
-    st.subheader("🏛️ ETF 资金流向")
+    st.subheader("🇺🇸 资金 & 📊 费率")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("🇺🇸 ETF 资金面", f"{s_f:.0f}分", help="美国现货ETF资金流向评分")
+        if s_f > 50: st.caption("✅ 华尔街机构正在 **净买入**")
+        else: st.caption("❌ 华尔街机构正在 **净流出**")
+        
+    with c2:
+        st.metric("📊 合约资金费率", fr_msg, f"{s_fr}分", delta_color="normal" if s_fr==50 else "inverse", help="永续合约资金费率")
+        # 智能解读文案
+        if s_fr < 40: st.caption("⚠️ **费率过高 (+)**: 多头太拥挤，小心主力砸盘！")
+        elif s_fr > 60: st.caption("🚀 **费率负值 (-)**: 空头太拥挤，可能暴力拉升！")
+        else: st.caption("⚖️ **费率正常**: 多空力量均衡。")
+
+    # === 🔥 新增：教科书级解释 (点击展开) ===
+    with st.expander("📚 新手必读：如何看懂资金与费率？(点击展开)", expanded=False):
+        st.markdown("""
+        ### 1. 🇺🇸 ETF 资金面 (代表：贝莱德/富达)
+        这是 **"聪明钱" (Smart Money)** 的动向，代表美国机构投资者的态度。
+        * **📈 机构买入**: 说明华尔街看好后市，愿意真金白银接盘。 -> **长期利好 (底气足)**
+        * **📉 机构卖出**: 说明机构在套现离场。 -> **长期利空 (抛压大)**
+
+        ### 2. 📊 合约资金费率 (代表：市场情绪/拥挤度)
+        这是 **"反向指标"**，用来判断市场是不是"疯了"。
+        * **🔴 费率为正 (+)**: **多头付钱给空头**。说明做多的人非常多。
+            * **0.01%**: 正常牛市情绪。
+            * **> 0.03% (危险)**: 全网都在无脑做多，**车太重了**。主力往往会故意**暴跌**来清算这些多头 (多杀多)。
+        * **🟢 费率为负 (-)**: **空头付钱给多头**。说明做空的人非常多。
+            * **< 0%**: 市场情绪悲观。
+            * **< -0.01% (机会)**: 全网都在无脑做空。主力往往会故意**暴涨**来打爆空头 (轧空/逼空)。
+            
+        **👉 口诀：费率太高不追多，费率太低不追空。**
+        """)
+
+    st.divider()
+    
+    st.subheader("🏛️ ETF 资金流向 (最近5天)")
+    st.caption("观察 IBIT (贝莱德) 和 FBTC (富达) 的涨跌幅，它们是市场的风向标。")
     cols = st.columns(4)
     for i, t in enumerate(['IBIT', 'FBTC', 'BITB', 'ARKB']):
         try:
             d = yf.Ticker(t).history(period="5d")
-            if not d.empty: cols[i].metric(t, f"${d['Close'].iloc[-1]:.2f}", f"{(d['Close'].iloc[-1]-d['Close'].iloc[-2])/d['Close'].iloc[-2]*100:.2f}%")
+            if not d.empty: 
+                change = (d['Close'].iloc[-1]-d['Close'].iloc[-2])/d['Close'].iloc[-2]*100
+                cols[i].metric(t, f"${d['Close'].iloc[-1]:.2f}", f"{change:.2f}%")
         except: pass
 
 with tab4:
-    st.metric("CMF 主力吸筹分", f"{s_m:.0f}", delta=">50吸筹" if s_m>50 else "出货")
+    st.subheader("🐋 主力 & 资金流")
+    
+    # 1. 核心指标显示
+    # 使用 help 参数提供悬停提示
+    st.metric("CMF 主力吸筹分", f"{s_m:.0f}分", delta="吸筹 (进场)" if s_m > 50 else "出货 (离场)", help="基于 Chaikin Money Flow (CMF) 计算的主力意图评分")
+    
+    # 智能解读文案
+    if s_m > 60:
+        st.caption("🟢 **强力吸筹**: 大户/机构正在**买入**，底部支撑较强。")
+    elif s_m < 40:
+        st.caption("🔴 **强力出货**: 大户/机构正在**抛售**，顶部压力巨大。")
+    else:
+        st.caption("⚪ **洗盘/观望**: 主力动作不明显，市场处于震荡期。")
+
+    # 2. 资金流向图表 (可视化)
     if df_k is not None:
+        # 计算每一根K线的资金净量 (Net Volume)
+        # 逻辑：如果收盘价 > 开盘价，视为买入量；反之视为卖出量
         nv = ((df_k['c'] - df_k['o']) / (df_k['h'] - df_k['l'])) * df_k['v']
-        st.plotly_chart(go.Figure(go.Bar(x=df_k['ts'], y=nv, marker_color=['#00CC96' if v>0 else '#FF4B4B' for v in nv])).update_layout(height=250, title="资金净流向"), use_container_width=True)
+        
+        fig_cmf = go.Figure(go.Bar(
+            x=df_k['ts'], 
+            y=nv, 
+            marker_color=['#00CC96' if v>0 else '#FF4B4B' for v in nv],
+            name="资金净量"
+        ))
+        fig_cmf.update_layout(
+            height=300, 
+            title="📊 资金净流向 (Net Volume Flow)",
+            margin=dict(t=40, b=20, l=20, r=20),
+            yaxis_title="成交量力度"
+        )
+        st.plotly_chart(fig_cmf, use_container_width=True)
+
+    # 3. 教科书级解释 (Expander)
+    st.divider()
+    with st.expander("📚 新手必读：如何看懂主力吸筹 (CMF)？", expanded=False):
+        st.markdown("""
+        ### 🐋 什么是“主力” (Whales)？
+        主力通常指拥有巨额资金的机构、交易所冷钱包或超级大户。他们的买卖行为往往决定了未来的趋势方向。
+
+        ### 📊 评分逻辑 (基于 CMF 指标)
+        AI 使用 **Chaikin Money Flow (CMF)** 来监控资金是 **流进** 还是 **流出**。
+        
+        * **🟢 吸筹 (Accumulation) [分数 > 50]**: 
+            * **现象**: 收盘价经常收在最高价附近，且伴随大成交量。
+            * **含义**: 主力在偷偷买入，把价格托住，通常是**拉升前兆**。
+            
+        * **🔴 出货 (Distribution) [分数 < 50]**: 
+            * **现象**: 收盘价经常收在最低价附近，且伴随大成交量。
+            * **含义**: 主力在趁反弹偷偷卖出，通常是**砸盘前兆**。
+
+        ### 🔥 进阶战法：顶底背离
+        * **底背离 (买入神技)**: 当 **价格在创新低**，但 **主力分却在变高**。
+            * *解读*: 散户在恐慌割肉，但主力在悄悄抄底。 -> **强烈看涨**
+        * **顶背离 (逃顶神技)**: 当 **价格在创新高**，但 **主力分却在变低**。
+            * *解读*: 价格虽然在涨（诱多），但主力已经在撤退了。 -> **强烈看跌**
+        """)
 
 with tab5:
     st.metric("AI 舆情情绪分", f"{s_n:.0f}", delta=">50乐观")
@@ -422,5 +651,5 @@ with tab6:
     if backtest_df is not None and not backtest_df.empty:
         tot = wins+losses
         st.metric("回测胜率 (非实盘)", f"{(wins/tot*100) if tot else 0:.1f}%", f"总盈亏 ${backtest_df['盈亏'].sum():.2f}")
-        st.dataframe(backtest_df, use_container_width=True)
+        st.dataframe(backtest_df)
     else: st.info("无回测记录")
