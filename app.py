@@ -287,44 +287,53 @@ class OptimizedCommander:
         except Exception as e:
             # print(f"智能训练出错: {e}")
             return {'sl_multiplier': 2.0, 'rr': 1.5, 'mode': '错误'}
-        # === F. 获取资金费率 (US IP 修复版) ===
+        # === C. 获取资金费率 (增强版：优先币安 -> 备用Gate -> 兜底默认) ===
     def get_funding_rate(self):
-        # 通道 1: Kraken Futures (美国合规，绝对可用)
         try:
-            exchange = ccxt.krakenfutures({'enableRateLimit': True, 'timeout': 2000})
-            # Kraken 合约代码通常是 PF_XBTUSD
-            funding = exchange.fetch_funding_rate('PF_XBTUSD')
-            print("✅ 成功连接: Kraken Futures")
-            return float(funding['fundingRate'])
-        except Exception as e:
-            # print(f"Kraken 失败: {e}")
-            pass
-
-        # 通道 2: Gate.io (IP限制较宽)
-        try:
-            exchange = ccxt.gate({'enableRateLimit': True, 'timeout': 2000, 'options': {'defaultType': 'swap'}})
-            # Gate 合约代码: BTC_USDT
-            funding = exchange.fetch_funding_rate('BTC_USDT')
-            print("✅ 成功连接: Gate.io")
-            return float(funding['fundingRate'])
-        except Exception:
-            pass
-
-        # 通道 3: Binance HTTP (仅作最后尝试，美国IP会失败)
-        try:
+            # 方案 1: 优先尝试币安 (Binance) - 最权威
+            # 注意：如果网络不通，这里会迅速超时跳到方案 2
             url = "https://fapi.binance.com/fapi/v1/premiumIndex"
-            params = {'symbol': f"{self.symbol.split('-')[0]}USDT"}
-            headers = {'User-Agent': 'Mozilla/5.0'} # 伪装浏览器
-            r = requests.get(url, params=params, headers=headers, timeout=2)
+            symbol_str = self.symbol.split('-')[0] + "USDT" # 格式转换: BTC-USD -> BTCUSDT
+            params = {'symbol': symbol_str}
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            
+            r = requests.get(url, params=params, headers=headers, timeout=3)
             if r.status_code == 200:
                 data = r.json()
-                print("✅ 成功连接: Binance HTTP")
-                return float(data['lastFundingRate'])
-        except Exception:
+                rate = float(data['lastFundingRate'])
+                return rate # 成功！直接返回 (例如 0.0001)
+        except:
+            pass # 币安失败，默默进入下一步
+
+        try:
+            # 方案 2: 强力备用 Gate.io (无需翻墙，CCXT直连)
+            # Gate 的 API 在国内通常比币安好连
+            import ccxt
+            exchange = ccxt.gate({
+                'enableRateLimit': True, 
+                'timeout': 3000, 
+                'options': {'defaultType': 'swap'} # 指定请求合约数据
+            })
+            
+            # 格式转换: BTC-USD -> BTC_USDT
+            target_symbol = self.symbol.replace('-', '_') 
+            
+            funding = exchange.fetch_funding_rate(target_symbol)
+            rate = float(funding['fundingRate'])
+            
+            # 🛡️ 数据清洗：防止出现 -25% 这种乌龙
+            # 正常费率通常在 -0.01 到 0.01 之间。如果绝对值 > 0.5 (50%)，肯定是数据源错了
+            if abs(rate) > 0.5: 
+                return 0.0001 # 数据异常，返回默认值
+            
+            return rate
+        except Exception as e:
+            # print(f"Gate获取失败: {e}") # 调试用，平时可以注释掉
             pass
-
-        return None # 彻底失败
-
+            
+        # 方案 3: 最后的倔强 (兜底值)
+        # 如果所有交易所都连不上，为了不让程序报错崩溃，返回标准牛市费率
+        return 0.0001 # 对应 0.01%            
     # === G. 综合打分 ===
     def analyze_score(self, df, etf_ticker, symbol):
         # 初始化默认值
