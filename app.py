@@ -188,84 +188,105 @@ class OptimizedCommander:
             return res_df, wins, losses
         except: return None, 0, 0
         
-        # === H. AI 参数自适应引擎 (NEW!) ===
+        # === H. AI 参数自适应引擎 (Pro版：ATR动态风控 + 趋势感知) ===
     def ai_optimize_parameters(self, days=30):
         """
-        AI 机器人：自动寻找最近一段行情中胜率最高的 止盈/止损 比例
+        AI 进化方向：
+        1. 不再使用固定百分比止损，而是使用 ATR (波动率) 倍数。
+        2. 引入 ADX 过滤：趋势弱时不硬做趋势单。
+        3. 评分标准：不再只看利润，引入胜率权重 (利润 * 胜率)，防止“一次暴富、九次爆仓”的参数胜出。
         """
         try:
             # 1. 获取数据
-            df = self.get_data() # 获取最新数据
-            if df is None or len(df) < 100: return None
+            df = self.get_data()
+            if df is None or len(df) < 200: return {'sl_multiplier': 2.0, 'rr': 1.5, 'mode': 'Unknown'}
             
-            # 为了速度，只切片最近 days 天的数据进行训练
-            # 计算切片索引
+            # 计算切片
             rows_per_day = 24 if '1h' in self.tf else (96 if '15m' in self.tf else 1)
             train_len = days * rows_per_day
-            if len(df) > train_len:
-                train_df = df.iloc[-train_len:]
-            else:
-                train_df = df
-                
-            # 2. 定义搜索空间 (让 AI 尝试这些组合)
-            # 止损比例: 1% 到 5%
-            sl_range = [0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05] 
-            # 盈亏比: 1:1 到 1:3
-            rr_range = [1.0, 1.5, 2.0, 2.5, 3.0] 
+            train_df = df.iloc[-train_len:].copy() if len(df) > train_len else df.copy()
+            
+            # --- 🤖 智能指标计算 ---
+            # A. 计算 ATR (波动率尺子)
+            train_df['atr'] = ta.volatility.AverageTrueRange(train_df['h'], train_df['l'], train_df['c'], window=14).average_true_range()
+            # B. 计算 ADX (趋势强度尺子)
+            train_df['adx'] = ta.trend.ADXIndicator(train_df['h'], train_df['l'], train_df['c'], window=14).adx()
+            
+            # 2. 定义搜索空间 (更高级的参数)
+            # 止损不再是 %，而是 ATR 的倍数 (1.5倍波动, 2倍波动...)
+            atr_mult_range = [1.5, 2.0, 2.5, 3.0] 
+            rr_range = [1.0, 1.5, 2.0, 3.0]
             
             best_score = -9999
-            best_params = {'sl_pct': 0.02, 'rr': 1.5} # 默认值
+            best_params = {'sl_multiplier': 2.0, 'rr': 1.5, 'mode': '震荡(默认)'}
             
-            # 3. 开始暴力训练 (Grid Search)
-            # print("🤖 AI 正在训练中...")
-            
-            for sl_pct in sl_range:
+            # 3. 智能回测循环
+            for atr_mult in atr_mult_range:
                 for rr in rr_range:
-                    # 模拟回测
                     total_pnl = 0
                     wins = 0
-                    count = 0
+                    total_trades = 0
                     
-                    # 简化版快速回测循环
-                    # 假设每次都在 EMA 附近开单 (模拟策略逻辑)
+                    # 模拟交易逻辑
                     ema_col = train_df['ema200']
                     close_col = train_df['c']
+                    atr_col = train_df['atr']
+                    adx_col = train_df['adx']
                     
-                    for i in range(1, len(train_df)):
-                        price = close_col.iloc[i]
-                        ema = ema_col.iloc[i]
+                    for i in range(1, len(train_df)-1):
+                        # 过滤：如果是趋势策略，要求 ADX > 20 才开单 (避免在死鱼盘里频繁止损)
+                        if adx_col.iloc[i] < 20: continue 
                         
-                        # 简单的趋势跟随逻辑作为训练基准
-                        if price > ema: # 多头趋势
+                        price = close_col.iloc[i]
+                        atr = atr_col.iloc[i]
+                        
+                        # 简单的趋势跟随信号
+                        if price > ema_col.iloc[i]: 
                             entry = price
-                            stop_loss = entry * (1 - sl_pct)
-                            take_profit = entry * (1 + sl_pct * rr)
+                            # 🔥 智能止损：当前价格减去 N 倍的波动率
+                            stop_loss_dist = atr * atr_mult 
+                            sl = entry - stop_loss_dist
+                            tp = entry + (stop_loss_dist * rr)
                             
-                            # 往后看几根K线定输赢 (简化)
-                            future = train_df.iloc[i+1:min(i+10, len(train_df))]
+                            # 往后看
+                            future = train_df.iloc[i+1:min(i+20, len(train_df))]
                             if future.empty: continue
                             
-                            if future['l'].min() <= stop_loss:
-                                total_pnl -= 1 # 亏1份
-                            elif future['h'].max() >= take_profit:
-                                total_pnl += rr # 赚rr份
+                            if future['l'].min() <= sl:
+                                total_pnl -= 1 # 亏损 1R
+                                total_trades += 1
+                            elif future['h'].max() >= tp:
+                                total_pnl += rr # 盈利 RR
                                 wins += 1
-                            count += 1
+                                total_trades += 1
+                                
+                    # 4. 📝 智能评分系统 (Sharpe Ratio 简化版)
+                    # 我们不只看总利润，还要看胜率。
+                    # 得分 = 总利润 * (胜率权重)
+                    if total_trades > 0:
+                        win_rate = wins / total_trades
+                        # 惩罚低胜率：如果胜率低于 40%，分数打折
+                        penalty = 1.0 if win_rate > 0.4 else 0.5
+                        
+                        final_score = total_pnl * penalty
+                        
+                        if final_score > best_score:
+                            best_score = final_score
+                            # 判断当前环境
+                            current_adx = adx_col.iloc[-1]
+                            market_mode = "🔥单边趋势" if current_adx > 25 else "🌊震荡整理"
                             
-                    # 4. 给这组参数打分
-                    if count > 0:
-                        score = total_pnl # 净利润就是分数
-                        if score > best_score:
-                            best_score = score
-                            best_params = {'sl_pct': sl_pct, 'rr': rr}
+                            best_params = {
+                                'sl_multiplier': atr_mult, 
+                                'rr': rr,
+                                'mode': market_mode
+                            }
                             
             return best_params
             
         except Exception as e:
-            print(f"AI 训练失败: {e}")
-            return {'sl_pct': 0.02, 'rr': 1.5} # 出错返回默认
-
-
+            # print(f"智能训练出错: {e}")
+            return {'sl_multiplier': 2.0, 'rr': 1.5, 'mode': '错误'}
         # === F. 获取资金费率 (US IP 修复版) ===
     def get_funding_rate(self):
         # 通道 1: Kraken Futures (美国合规，绝对可用)
@@ -417,27 +438,73 @@ if not log_df.empty:
         logger.save_log(edited_df)
         st.rerun()
 else:
-    st.sidebar.info("暂无记录，快去决策页开单吧！")
+    # === AI 优化建议模块 (严格缩进版) ===
+    if st.sidebar.checkbox("🤖 开启 Pro级 AI 自适应", value=True):
+        # 注意：这里缩进是 4 个空格
+        with st.sidebar.status("🧠 AI 正在计算 ATR 波动率与 ADX 趋势...", expanded=True) as status:
+            best_params = bot.ai_optimize_parameters(days=30)
+            status.update(label="✅ 智能分析完成！", state="complete", expanded=False)
+        
+        # 注意：这里的 if 必须和上面的 with 保持垂直对齐 (也是 4 个空格)
+        if best_params:
+            st.sidebar.markdown(f"### 🧬 AI 环境诊断: {best_params.get('mode', '未知')}")
+            
+            # 获取当前数据用于计算具体价格
+            df_curr = bot.get_data()
+            if df_curr is not None:
+                # 1. 计算当前 ATR 和 价格
+                current_atr = ta.volatility.AverageTrueRange(df_curr['h'], df_curr['l'], df_curr['c']).average_true_range().iloc[-1]
+                curr_price = df_curr['c'].iloc[-1]
+                curr_ema = df_curr['ema200'].iloc[-1]
+                
+                # 2. 计算 AI 建议的距离
+                sl_dist = current_atr * best_params['sl_multiplier']
+                tp_dist = sl_dist * best_params['rr']
+                
+                # 3. 自动判断方向 (价格在EMA之上=多，之下=空)
+                is_long = curr_price > curr_ema
+                direction_str = "多头 (Long)" if is_long else "空头 (Short)"
+                
+                if is_long:
+                    suggest_sl = curr_price - sl_dist
+                    suggest_tp = curr_price + tp_dist
+                else:
+                    suggest_sl = curr_price + sl_dist
+                    suggest_tp = curr_price - tp_dist
+
+                # 4. 显示结果
+                st.sidebar.success(f"🎯 **AI 建议挂单 ({direction_str})**")
+                st.sidebar.info(f"""
+                基准现价: **${curr_price:.2f}**
+                
+                🛑 **建议止损**: **${suggest_sl:.2f}**
+                *(距离 {best_params['sl_multiplier']}x ATR)*
+                
+                💰 **建议止盈**: **${suggest_tp:.2f}**
+                *(盈亏比 1:{best_params['rr']})*
+                """)
+                
+                if "震荡" in best_params.get('mode', ''):
+                    st.sidebar.caption("⚠️ **震荡期**：建议见好就收，不要贪。")
+                else:
+                    st.sidebar.caption("🚀 **趋势期**：建议拿住单子，博取高收益。")
+            else:
+                st.sidebar.warning("数据不足，无法计算 ATR。")
 
 # 初始化
 bot = OptimizedCommander(symbol, tf)
 # ... 之前的主程序代码 ...
 
 # === 🔥 AI 进化模块 ===
-if st.sidebar.checkbox("🤖 开启 AI 参数自适应", value=False):
-    with st.sidebar.status("🤖 AI 机器人正在学习最近30天行情...", expanded=True) as status:
+# === 保留计算，但删除显示 ===
+if st.sidebar.checkbox("🤖 开启 Pro级 AI 自适应", value=True):
+    with st.sidebar.status("🧠 AI 正在计算 ATR 波动率与 ADX 趋势...", expanded=True) as status:
         best_params = bot.ai_optimize_parameters(days=30)
-        status.update(label="✅ 学习完成！", state="complete", expanded=False)
-        
-    if best_params:
-        st.sidebar.markdown("### 🧠 AI 优化建议")
-        st.sidebar.info(f"""
-        根据近期波动，最佳参数为：
-        - **止损幅度**: {best_params['sl_pct']*100:.1f}%
-        - **盈亏比**: 1:{best_params['rr']}
-        """)
-        # 你甚至可以让 AI 自动覆盖你的 plan
-        # (这需要修改 calculate_strategy 接收外部参数，比较复杂，暂时先手动参考)
+        status.update(label="✅ 智能分析完成！", state="complete", expanded=False)
+else:
+    best_params = None
+    
+# (原来的 if best_params: 以及后面的一大堆显示代码，统统删掉！)
 with st.spinner('🚀 正在全速运转...'):
     df_k = bot.get_data()
     curr_price = df_k['c'].iloc[-1] if df_k is not None else 0
@@ -448,6 +515,52 @@ with st.spinner('🚀 正在全速运转...'):
     if isinstance(ref_df.columns, pd.MultiIndex): ref_df.columns = ref_df.columns.get_level_values(0)
     
     plan = bot.calculate_strategy(curr_price, ref_df, curr_ema, use_ema_filter)
+    # ... (上面是 plan = bot.calculate_strategy(...) )
+
+    # === 🔥 AI 智能风控 (修正版：紧跟策略信号) ===
+    # 只有当 1.策略有计划 2.AI算出了参数 时，才显示建议
+    if plan and plan['is_allowed'] and best_params:
+        
+        # 1. 获取当前 ATR (用于计算宽窄)
+        df_curr = bot.get_data()
+        current_atr = ta.volatility.AverageTrueRange(df_curr['h'], df_curr['l'], df_curr['c']).average_true_range().iloc[-1]
+        
+        # 2. 读取主策略的信号 (关键修正！)
+        strategy_entry = plan['entry']            # 你的开仓价 (Pivot点位)
+        is_long = "做多" in plan['dir']            # 你的方向
+        
+        # 3. 利用 AI 参数计算 止盈/止损
+        # 止损距离 = ATR * AI倍数
+        sl_dist = current_atr * best_params['sl_multiplier']
+        tp_dist = sl_dist * best_params['rr']
+        
+        if is_long:
+            ai_sl = strategy_entry - sl_dist
+            ai_tp = strategy_entry + tp_dist
+            dir_icon = "🟢 做多 (Long)"
+        else: # 做空
+            ai_sl = strategy_entry + sl_dist
+            ai_tp = strategy_entry - tp_dist
+            dir_icon = "🔴 做空 (Short)"
+
+        # 4. 显示在侧边栏 (虽然代码在这里，但可以用 st.sidebar 投射过去)
+        st.sidebar.markdown("---")
+        st.sidebar.success(f"🧠 **AI 优化建议 (基于当前信号)**")
+        
+        st.sidebar.info(f"""
+        **针对开仓价 ${strategy_entry:.2f} 的 {dir_icon} 建议：**
+        
+        🛡️ **AI 止损**: **${ai_sl:.2f}**
+        *(距离 -{sl_dist:.2f})*
+        
+        🎯 **AI 止盈**: **${ai_tp:.2f}**
+        *(距离 +{tp_dist:.2f})*
+        
+        ---
+        📊 **参数逻辑**: 
+        止损 = {best_params['sl_multiplier']} x ATR
+        盈亏比 = 1:{best_params['rr']} ({best_params.get('mode', '')})
+        """)
     
     # 接收参数
     s_t, s_f, s_m, s_n, ema_val, news_list, s_fr, fr_msg = bot.analyze_score(df_k, 'IBIT', symbol)
