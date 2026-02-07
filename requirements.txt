@@ -1,11 +1,9 @@
 streamlit
-ccxt
 yfinance
 pandas
 ta
 plotly
 feedparser
 textblob
+ccxt
 requests
-datatime
-os
