@@ -402,7 +402,11 @@ tf = tf_options[st.sidebar.selectbox("作战周期", list(tf_options.keys()), in
 use_ema_filter = st.sidebar.checkbox("✅ 开启 EMA 过滤", value=True)
 backtest_days = st.sidebar.slider("回测天数", 30, 365, 90)
 
-# === 插入到 bot = OptimizedCommander(...) 之后 ===
+# 🔥🔥🔥 关键修复：必须在这里先初始化机器人！🔥🔥🔥
+# 只有先定义了 bot，后面的 AI 和记账功能才能正常工作
+bot = OptimizedCommander(symbol, tf) 
+
+# === C. 我的实盘账本 (手工版) ===
 logger = TradeLogger() # 初始化记账员
 
 st.sidebar.divider()
@@ -412,8 +416,8 @@ log_df = logger.load_log()
 if not log_df.empty:
     # 算总账
     total_pnl = log_df['盈亏(U)'].sum()
-    win_count = len(log_df[log_df['盈亏(U)'] > 0])
     done_count = len(log_df[log_df['状态'].isin(['✅止盈', '❌止损'])])
+    win_count = len(log_df[log_df['盈亏(U)'] > 0])
     win_rate = (win_count / done_count * 100) if done_count > 0 else 0
     
     c1, c2 = st.sidebar.columns(2)
@@ -438,71 +442,17 @@ if not log_df.empty:
         logger.save_log(edited_df)
         st.rerun()
 else:
-    # === AI 优化建议模块 (严格缩进版) ===
-    if st.sidebar.checkbox("🤖 开启 Pro级 AI 自适应", value=True):
-        # 注意：这里缩进是 4 个空格
-        with st.sidebar.status("🧠 AI 正在计算 ATR 波动率与 ADX 趋势...", expanded=True) as status:
-            best_params = bot.ai_optimize_parameters(days=30)
-            status.update(label="✅ 智能分析完成！", state="complete", expanded=False)
-        
-        # 注意：这里的 if 必须和上面的 with 保持垂直对齐 (也是 4 个空格)
-        if best_params:
-            st.sidebar.markdown(f"### 🧬 AI 环境诊断: {best_params.get('mode', '未知')}")
-            
-            # 获取当前数据用于计算具体价格
-            df_curr = bot.get_data()
-            if df_curr is not None:
-                # 1. 计算当前 ATR 和 价格
-                current_atr = ta.volatility.AverageTrueRange(df_curr['h'], df_curr['l'], df_curr['c']).average_true_range().iloc[-1]
-                curr_price = df_curr['c'].iloc[-1]
-                curr_ema = df_curr['ema200'].iloc[-1]
-                
-                # 2. 计算 AI 建议的距离
-                sl_dist = current_atr * best_params['sl_multiplier']
-                tp_dist = sl_dist * best_params['rr']
-                
-                # 3. 自动判断方向 (价格在EMA之上=多，之下=空)
-                is_long = curr_price > curr_ema
-                direction_str = "多头 (Long)" if is_long else "空头 (Short)"
-                
-                if is_long:
-                    suggest_sl = curr_price - sl_dist
-                    suggest_tp = curr_price + tp_dist
-                else:
-                    suggest_sl = curr_price + sl_dist
-                    suggest_tp = curr_price - tp_dist
+    st.sidebar.info("暂无交易记录，快去决策页开单吧！")
 
-                # 4. 显示结果
-                st.sidebar.success(f"🎯 **AI 建议挂单 ({direction_str})**")
-                st.sidebar.info(f"""
-                基准现价: **${curr_price:.2f}**
-                
-                🛑 **建议止损**: **${suggest_sl:.2f}**
-                *(距离 {best_params['sl_multiplier']}x ATR)*
-                
-                💰 **建议止盈**: **${suggest_tp:.2f}**
-                *(盈亏比 1:{best_params['rr']})*
-                """)
-                
-                if "震荡" in best_params.get('mode', ''):
-                    st.sidebar.caption("⚠️ **震荡期**：建议见好就收，不要贪。")
-                else:
-                    st.sidebar.caption("🚀 **趋势期**：建议拿住单子，博取高收益。")
-            else:
-                st.sidebar.warning("数据不足，无法计算 ATR。")
-
-# 初始化
-bot = OptimizedCommander(symbol, tf)
-# ... 之前的主程序代码 ...
-
-# === 🔥 AI 进化模块 ===
-# === 保留计算，但删除显示 ===
+# === D. AI 参数计算 (只计算，不显示，避免报错) ===
 if st.sidebar.checkbox("🤖 开启 Pro级 AI 自适应", value=True):
     with st.sidebar.status("🧠 AI 正在计算 ATR 波动率与 ADX 趋势...", expanded=True) as status:
+        # 因为 bot 已经在上面初始化了，所以这里不会再报错了！
         best_params = bot.ai_optimize_parameters(days=30)
         status.update(label="✅ 智能分析完成！", state="complete", expanded=False)
 else:
-    best_params = None
+    best_params = None        
+  
     
 # (原来的 if best_params: 以及后面的一大堆显示代码，统统删掉！)
 with st.spinner('🚀 正在全速运转...'):
