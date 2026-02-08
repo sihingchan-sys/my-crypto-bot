@@ -488,21 +488,22 @@ if st.sidebar.checkbox("🤖 开启 Pro级 AI 自适应", value=True):
 else:
     best_params = None        
   
-    
+ # === 主程序开始 ===
 with st.spinner('🚀 正在全速运转...'):
-    # 1. 获取当前 K 线 (用于画图)
+    # 1. 获取当前 K 线 (用于画图、AI评分)
     df_k = bot.get_data()
     curr_price = df_k['c'].iloc[-1] if df_k is not None else 0
     curr_ema = df_k['ema200'].iloc[-1] if df_k is not None else None
     
     # 2. 获取参考 K 线 (用于计算 Pivot 地图/开仓价)
-    # --- 🔥 核心升级：改用 CCXT 抓取参考数据 (解决8点不更新问题) ---
+    # --- 🔥 核心修改：定义周期映射 ---
+    # 15m -> 看日线 (1d)
+    # 1h  -> 看日线 (1d) <--- 关键修改！让1h也是每天更新
+    # 1d  -> 看周线 (1w)
+    ccxt_tf_map = {'15m': '1d', '1h': '1d', '1d': '1w'} 
+    target_tf = ccxt_tf_map.get(tf, '1d')
+    
     try:
-        # 定义周期映射 (15m看日线图，1h看周线图)
-        # CCXT 格式: 1d=日线, 1w=周线
-        ccxt_tf_map = {'15m': '1d', '1h': '1w', '1d': '1M'} 
-        target_tf = ccxt_tf_map.get(tf, '1d')
-        
         import ccxt
         # 直接使用 Gate (速度快，且不用翻墙)
         ex_ref = ccxt.gate({'timeout': 3000}) 
@@ -517,14 +518,13 @@ with st.spinner('🚀 正在全速运转...'):
         ref_df.set_index('ts', inplace=True)
         
     except Exception as e:
-        # 万一 CCXT 失败，才回退到 Yahoo (虽然慢，总比报错好)
-        # print(f"CCXT数据获取失败: {e}, 正在切换回 Yahoo...")
-        ref_config = {'15m': '1d', '1h': '1wk', '1d': '1mo'}
+        # 万一 CCXT 失败，回退到 Yahoo
+        ref_config = {'15m': '1d', '1h': '1d', '1d': '1wk'}
         ref_df = yf.download(symbol, period='2y', interval=ref_config.get(tf, '1d'), progress=False)
         if isinstance(ref_df.columns, pd.MultiIndex): ref_df.columns = ref_df.columns.get_level_values(0)
     # -----------------------------------------------------
 
-    # 3. 计算策略
+    # 3. 计算策略 (Pivot Point)
     plan = bot.calculate_strategy(curr_price, ref_df, curr_ema, use_ema_filter)
 
     # === 🔥 AI 智能风控 (联动版) ===
@@ -540,7 +540,6 @@ with st.spinner('🚀 正在全速运转...'):
         is_long = "做多" in plan['dir']            # 你的方向
         
         # 3. 利用 AI 参数计算 止盈/止损
-        # 止损距离 = ATR * AI倍数
         sl_dist = current_atr * best_params['sl_multiplier']
         tp_dist = sl_dist * best_params['rr']
         
@@ -572,16 +571,19 @@ with st.spinner('🚀 正在全速运转...'):
         盈亏比 = 1:{best_params['rr']} ({best_params.get('mode', '')})
         """)
     
-    # 接收参数
+    # 4. 计算 AI 综合评分
     s_t, s_f, s_m, s_n, ema_val, news_list, s_fr, fr_msg = bot.analyze_score(df_k, 'IBIT', symbol)
     
     # 加权公式
     final_score = s_t*0.4 + s_f*0.2 + s_m*0.2 + s_fr*0.2
     
-    # 回测
-    backtest_df, wins, losses = bot.run_backtest(backtest_days, use_ema_filter)# === 主界面 Tabs ===
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🏠 决策", "📈 技术", "🇺🇸 资金", "🐋 主力", "🗞️ 舆情", "🧪 回测"])
+    # 5. 执行回测
+    backtest_df, wins, losses = bot.run_backtest(backtest_days, use_ema_filter)
 
+# === 🔥🔥🔥 关键修复：必须在这里定义 6 个标签页，否则 tab1 会报错！🔥🔥🔥 ===
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🏠 决策", "📈 技术", "🇺🇸 资金", "🐋 主力", "🗞️ 舆情", "📝 回测"])
+
+# === Tab 1: 决策仪表盘 ===
 with tab1:
     c1, c2 = st.columns([1, 2])
     with c1:
