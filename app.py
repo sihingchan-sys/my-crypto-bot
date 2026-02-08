@@ -287,53 +287,54 @@ class OptimizedCommander:
         except Exception as e:
             # print(f"智能训练出错: {e}")
             return {'sl_multiplier': 2.0, 'rr': 1.5, 'mode': '错误'}
-        # === C. 获取资金费率 (增强版：优先币安 -> 备用Gate -> 兜底默认) ===
+# === C. 获取资金费率 (修复版：Binance -> OKX -> Gate -> 报错) ===
     def get_funding_rate(self):
+        # 1. 尝试币安 (Binance)
         try:
-            # 方案 1: 优先尝试币安 (Binance) - 最权威
-            # 注意：如果网络不通，这里会迅速超时跳到方案 2
             url = "https://fapi.binance.com/fapi/v1/premiumIndex"
-            symbol_str = self.symbol.split('-')[0] + "USDT" # 格式转换: BTC-USD -> BTCUSDT
-            params = {'symbol': symbol_str}
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            
-            r = requests.get(url, params=params, headers=headers, timeout=3)
+            symbol_str = self.symbol.split('-')[0] + "USDT" # BTCUSDT
+            r = requests.get(url, params={'symbol': symbol_str}, timeout=2)
             if r.status_code == 200:
-                data = r.json()
-                rate = float(data['lastFundingRate'])
-                return rate # 成功！直接返回 (例如 0.0001)
-        except:
-            pass # 币安失败，默默进入下一步
+                rate = float(r.json()['lastFundingRate'])
+                print(f"✅ 币安费率获取成功: {rate*100:.4f}%")
+                return rate
+        except Exception as e:
+            print(f"⚠️ 币安获取失败: {e}")
 
+        # 2. 尝试 OKX (新增！通常比Gate更稳)
         try:
-            # 方案 2: 强力备用 Gate.io (无需翻墙，CCXT直连)
-            # Gate 的 API 在国内通常比币安好连
             import ccxt
-            exchange = ccxt.gate({
-                'enableRateLimit': True, 
-                'timeout': 3000, 
-                'options': {'defaultType': 'swap'} # 指定请求合约数据
-            })
+            # OKX 不需要 API Key 也能查公有数据
+            okx = ccxt.okx({'timeout': 3000, 'enableRateLimit': True})
+            # 格式转换: BTC-USD -> BTC/USDT:USDT (CCXT标准格式)
+            base_coin = self.symbol.split('-')[0]
+            target = f"{base_coin}/USDT:USDT" 
             
-            # 格式转换: BTC-USD -> BTC_USDT
-            target_symbol = self.symbol.replace('-', '_') 
-            
-            funding = exchange.fetch_funding_rate(target_symbol)
+            funding = okx.fetch_funding_rate(target)
             rate = float(funding['fundingRate'])
-            
-            # 🛡️ 数据清洗：防止出现 -25% 这种乌龙
-            # 正常费率通常在 -0.01 到 0.01 之间。如果绝对值 > 0.5 (50%)，肯定是数据源错了
-            if abs(rate) > 0.5: 
-                return 0.0001 # 数据异常，返回默认值
-            
+            print(f"✅ OKX 费率获取成功: {rate*100:.4f}%")
             return rate
         except Exception as e:
-            # print(f"Gate获取失败: {e}") # 调试用，平时可以注释掉
-            pass
+            print(f"⚠️ OKX 获取失败: {e}")
+
+        # 3. 尝试 Gate.io
+        try:
+            import ccxt
+            gate = ccxt.gate({'timeout': 3000, 'options': {'defaultType': 'swap'}})
+            target = self.symbol.replace('-', '_') # BTC_USDT
+            funding = gate.fetch_funding_rate(target)
+            rate = float(funding['fundingRate'])
+            print(f"✅ Gate 费率获取成功: {rate*100:.4f}%")
             
-        # 方案 3: 最后的倔强 (兜底值)
-        # 如果所有交易所都连不上，为了不让程序报错崩溃，返回标准牛市费率
-        return 0.0001 # 对应 0.01%            
+            # 过滤异常值
+            if abs(rate) > 0.5: return 0.0001
+            return rate
+        except Exception as e:
+            print(f"⚠️ Gate 获取失败: {e}")
+
+        # 4. 全部失败
+        print("❌ 所有交易所接口均超时/失败，返回默认值 0.01%")
+        return 0.0001 # 只有真的都没招了，才返回这个默认值            
     # === G. 综合打分 ===
     def analyze_score(self, df, etf_ticker, symbol):
         # 初始化默认值
