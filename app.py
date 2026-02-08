@@ -489,20 +489,45 @@ else:
     best_params = None        
   
     
-# (原来的 if best_params: 以及后面的一大堆显示代码，统统删掉！)
 with st.spinner('🚀 正在全速运转...'):
+    # 1. 获取当前 K 线 (用于画图)
     df_k = bot.get_data()
     curr_price = df_k['c'].iloc[-1] if df_k is not None else 0
     curr_ema = df_k['ema200'].iloc[-1] if df_k is not None else None
     
-    ref_config = {'15m': '1d', '1h': '1wk', '1d': '1mo'}
-    ref_df = yf.download(symbol, period='2y', interval=ref_config.get(tf, '1d'), progress=False)
-    if isinstance(ref_df.columns, pd.MultiIndex): ref_df.columns = ref_df.columns.get_level_values(0)
-    
-    plan = bot.calculate_strategy(curr_price, ref_df, curr_ema, use_ema_filter)
-    # ... (上面是 plan = bot.calculate_strategy(...) )
+    # 2. 获取参考 K 线 (用于计算 Pivot 地图/开仓价)
+    # --- 🔥 核心升级：改用 CCXT 抓取参考数据 (解决8点不更新问题) ---
+    try:
+        # 定义周期映射 (15m看日线图，1h看周线图)
+        # CCXT 格式: 1d=日线, 1w=周线
+        ccxt_tf_map = {'15m': '1d', '1h': '1w', '1d': '1M'} 
+        target_tf = ccxt_tf_map.get(tf, '1d')
+        
+        import ccxt
+        # 直接使用 Gate (速度快，且不用翻墙)
+        ex_ref = ccxt.gate({'timeout': 3000}) 
+        sym_ref = symbol.replace('-', '_') # 格式修正: BTC-USD -> BTC_USDT
+        
+        # 抓取数据 (只需要最近几根就够算 Pivot 了)
+        ohlcv_ref = ex_ref.fetch_ohlcv(sym_ref, target_tf, limit=10)
+        
+        # 转成 DataFrame
+        ref_df = pd.DataFrame(ohlcv_ref, columns=['ts', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        ref_df['ts'] = pd.to_datetime(ref_df['ts'], unit='ms')
+        ref_df.set_index('ts', inplace=True)
+        
+    except Exception as e:
+        # 万一 CCXT 失败，才回退到 Yahoo (虽然慢，总比报错好)
+        # print(f"CCXT数据获取失败: {e}, 正在切换回 Yahoo...")
+        ref_config = {'15m': '1d', '1h': '1wk', '1d': '1mo'}
+        ref_df = yf.download(symbol, period='2y', interval=ref_config.get(tf, '1d'), progress=False)
+        if isinstance(ref_df.columns, pd.MultiIndex): ref_df.columns = ref_df.columns.get_level_values(0)
+    # -----------------------------------------------------
 
-    # === 🔥 AI 智能风控 (修正版：紧跟策略信号) ===
+    # 3. 计算策略
+    plan = bot.calculate_strategy(curr_price, ref_df, curr_ema, use_ema_filter)
+
+    # === 🔥 AI 智能风控 (联动版) ===
     # 只有当 1.策略有计划 2.AI算出了参数 时，才显示建议
     if plan and plan['is_allowed'] and best_params:
         
@@ -510,7 +535,7 @@ with st.spinner('🚀 正在全速运转...'):
         df_curr = bot.get_data()
         current_atr = ta.volatility.AverageTrueRange(df_curr['h'], df_curr['l'], df_curr['c']).average_true_range().iloc[-1]
         
-        # 2. 读取主策略的信号 (关键修正！)
+        # 2. 读取主策略的信号
         strategy_entry = plan['entry']            # 你的开仓价 (Pivot点位)
         is_long = "做多" in plan['dir']            # 你的方向
         
@@ -528,7 +553,7 @@ with st.spinner('🚀 正在全速运转...'):
             ai_tp = strategy_entry - tp_dist
             dir_icon = "🔴 做空 (Short)"
 
-        # 4. 显示在侧边栏 (虽然代码在这里，但可以用 st.sidebar 投射过去)
+        # 4. 显示在侧边栏
         st.sidebar.markdown("---")
         st.sidebar.success(f"🧠 **AI 优化建议 (基于当前信号)**")
         
@@ -553,9 +578,8 @@ with st.spinner('🚀 正在全速运转...'):
     # 加权公式
     final_score = s_t*0.4 + s_f*0.2 + s_m*0.2 + s_fr*0.2
     
-    backtest_df, wins, losses = bot.run_backtest(backtest_days, use_ema_filter)
-
-# === 主界面 Tabs ===
+    # 回测
+    backtest_df, wins, losses = bot.run_backtest(backtest_days, use_ema_filter)# === 主界面 Tabs ===
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🏠 决策", "📈 技术", "🇺🇸 资金", "🐋 主力", "🗞️ 舆情", "🧪 回测"])
 
 with tab1:
