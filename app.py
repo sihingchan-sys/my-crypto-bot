@@ -146,47 +146,87 @@ class OptimizedCommander:
             'is_allowed': is_allowed, 'ref_date': last.name, 'raw_dir': raw_direction
         }
 
-    # === C. 回测引擎 ===
+# === C. 回测引擎 (修正版：1h 必须与实盘一致，使用日线数据) ===
     def run_backtest(self, days=90, use_filter=False):
         try:
-            tf_map = {'15m': {'interval': '1d', 'period': f"{days+60}d"}, '1h': {'interval': '1wk', 'period': '5y'}, '1d': {'interval': '1mo', 'period': '10y'}}
+            # --- 🔥 核心修改区 ---
+            # 原来: '1h': {'interval': '1wk', ...}  <-- 错误！这是周线
+            # 现在: '1h': {'interval': '1d', ...}   <-- 正确！与实盘保持一致
+            tf_map = {
+                '15m': {'interval': '1d', 'period': f"{days+60}d"}, 
+                '1h':  {'interval': '1d', 'period': '2y'},  # 改这里：1h 也要跑日线回测
+                '1d':  {'interval': '1wk', 'period': '5y'}  # 日线策略才跑周线回测
+            }
+            # --------------------
+            
             cfg = tf_map.get(self.tf, tf_map['15m'])
             
+            # 获取回测用的历史数据
             df = yf.download(self.symbol, period=cfg['period'], interval=cfg['interval'], progress=False)
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             if len(df) < 5: return None, 0, 0
             
+            # 计算趋势线
             window = 20 if cfg['interval'] != '1d' else 5
             df['ema_trend'] = ta.trend.EMAIndicator(df['Close'], window=window).ema_indicator()
-            df = df.iloc[:-1] 
             
+            # 这里的逻辑是：用“昨天”的数据算策略，在“今天”验证
+            # 所以我们要把 df 错位一下
             history, wins, losses = [], 0, 0
             start_idx = max(25, window + 5)
+            
+            # 确保数据够长
             if len(df) <= start_idx: return None, 0, 0
 
+            # 开始模拟每一天/每一周
             for i in range(start_idx, len(df)): 
-                yesterday, today = df.iloc[i-1], df.iloc[i]
+                yesterday = df.iloc[i-1]
+                today = df.iloc[i]
+                
+                # 传入 yesterday 的数据来制定今天的计划
+                # 注意：这里模拟的是用“截至昨天的历史数据”来计算
                 strat = self.calculate_strategy(today['Open'], df.iloc[:i], yesterday['ema_trend'], use_filter)
+                
                 if not strat or not strat['is_allowed']: continue 
                 
                 entry, tp, sl = strat['entry'], strat['tp'], strat['sl']
                 is_long = "做多" in strat['dir']
                 
-                if (today['Low'] <= entry <= today['High']):
+                # 判定胜负 (简单的最高/最低价判定)
+                if (today['Low'] <= entry <= today['High']): # 价格是否触碰到了挂单价
                     res, pnl = None, 0
                     if is_long:
-                        if today['Low'] <= sl: res, pnl = "止损", -1 * abs(entry-sl); losses += 1
-                        elif today['High'] >= tp: res, pnl = "止盈", abs(tp-entry); wins += 1
-                    else:
-                        if today['High'] >= sl: res, pnl = "止损", -1 * abs(sl-entry); losses += 1
-                        elif today['Low'] <= tp: res, pnl = "止盈", abs(entry-tp); wins += 1
+                        if today['Low'] <= sl: 
+                            res, pnl = "止损", -1 * abs(entry-sl)
+                            losses += 1
+                        elif today['High'] >= tp: 
+                            res, pnl = "止盈", abs(tp-entry)
+                            wins += 1
+                    else: # 做空
+                        if today['High'] >= sl: 
+                            res, pnl = "止损", -1 * abs(sl-entry)
+                            losses += 1
+                        elif today['Low'] <= tp: 
+                            res, pnl = "止盈", abs(entry-tp)
+                            wins += 1
                     
-                    if res: history.append({'日期': today.name.strftime('%Y-%m-%d'), '方向': "多" if is_long else "空", '结果': res, '盈亏': round(pnl, 2)})
+                    if res: 
+                        history.append({
+                            '日期': today.name.strftime('%Y-%m-%d'), 
+                            '方向': "多" if is_long else "空", 
+                            '结果': res, 
+                            '盈亏': round(pnl, 2)
+                        })
             
             res_df = pd.DataFrame(history)
-            if not res_df.empty and cfg['interval'] == '1d': res_df = res_df.tail(days)
+            # 如果数据太多，只截取用户设定的天数
+            if not res_df.empty: res_df = res_df.tail(days)
+            
             return res_df, wins, losses
-        except: return None, 0, 0
+            
+        except Exception as e:
+            # print(f"回测出错: {e}")
+            return None, 0, 0
         
         # === H. AI 参数自适应引擎 (Pro版：ATR动态风控 + 趋势感知) ===
     def ai_optimize_parameters(self, days=30):
@@ -660,18 +700,58 @@ with tab1:
         # 修复警告：DataFrame 移除 use_container_width
         st.dataframe(pd.DataFrame(table_data))
 
+# === Tab 2: 技术面 (增强版) ===
 with tab2:
+    st.subheader("📈 K线与趋势裁判")
+    
     if df_k is not None:
-        fig_k = go.Figure(go.Candlestick(x=df_k['ts'], open=df_k['o'], high=df_k['h'], low=df_k['l'], close=df_k['c']))
-        fig_k.add_trace(go.Scatter(x=df_k['ts'], y=df_k['ema200'], line=dict(color='orange'), name='EMA200'))
+        # 1. 绘制 K 线图
+        fig_k = go.Figure(go.Candlestick(x=df_k['ts'], open=df_k['o'], high=df_k['h'], low=df_k['l'], close=df_k['c'], name="K线"))
+        fig_k.add_trace(go.Scatter(x=df_k['ts'], y=df_k['ema200'], line=dict(color='orange', width=2), name='EMA200 (趋势线)'))
+        
+        # 画出挂单点位 (如果有计划)
         if plan and plan['is_allowed']:
             fig_k.add_hline(y=plan['entry'], line_dash="dash", line_color="blue", annotation_text="Entry")
             fig_k.add_hline(y=plan['tp'], line_dash="dot", line_color="green", annotation_text="TP")
             fig_k.add_hline(y=plan['sl'], line_dash="dot", line_color="red", annotation_text="SL")
-        fig_k.update_layout(height=500, xaxis_rangeslider_visible=False)
+            
+        fig_k.update_layout(height=500, xaxis_rangeslider_visible=False, margin=dict(t=20, b=20, l=20, r=20))
         st.plotly_chart(fig_k, use_container_width=True)
-        with st.expander("📚 指标说明"):
-            st.caption("🍊 EMA200: 牛熊分界线。🔵 Pivot: 挂单系统。")
+
+        # 2. 🔥 自动计算 EMA 坡度 (判断趋势方向)
+        # 逻辑：比较现在的 EMA 和 5根K线前的 EMA
+        try:
+            ema_now = df_k['ema200'].iloc[-1]
+            ema_prev = df_k['ema200'].iloc[-5]
+            is_uptrend = ema_now > ema_prev
+            
+            trend_str = "📈 向上爬坡 (多头趋势)" if is_uptrend else "📉 向下滑坡 (空头趋势)"
+            trend_color = "green" if is_uptrend else "red"
+        except:
+            trend_str = "⚪ 走平/数据不足"
+            trend_color = "gray"
+
+        # 3. 🔥 显示你要求的“顺大势”心法
+        st.info(f"🧭 **当前 EMA200 状态**: :{trend_color}[**{trend_str}**]")
+        
+        with st.expander("🧘‍♂️ **高手心法：如何只做顺势单? (Trend Only)**", expanded=True):
+            st.markdown(f"""
+            **不要和趋势作对！看一眼图中的橙色线 (EMA200)：**
+            
+            1.  **如果橙线正在 📈 向上爬坡**：
+                * ✅ AI 喊 **做多** ➡️ **果断挂单！** (顺风车)
+                * 🚫 AI 喊 **做空** ➡️ **无视！** (可能是假摔/回调)
+            
+            2.  **如果橙线正在 📉 向下滑坡**：
+                * ✅ AI 喊 **做空** ➡️ **果断挂单！** (落井下石)
+                * 🚫 AI 喊 **做多** ➡️ **无视！** (可能是死猫跳)
+            
+            ---
+            *当前策略建议：你现在的 EMA 是 **{trend_str}**，建议只接 **{'多单' if is_uptrend else '空单'}**。*
+            """)
+            
+    else:
+        st.warning("数据不足，无法显示技术图表")
 
 with tab3:
     st.subheader("🇺🇸 资金 & 📊 费率")
